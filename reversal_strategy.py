@@ -31,6 +31,7 @@ YES_MAX_ASK = Decimal("0.40")
 NO_NOTIONAL_PCT = Decimal("0.50")
 YES_NOTIONAL_PCT = Decimal("0.50")
 HIGH_FIRE_LOCAL_HOUR = 14
+HIGH_FIRE_LOCAL_HOUR_END = 17
 LOW_FIRE_LOCAL_HOUR_END = 10
 REQUIRE_FRESH_OBS_SECONDS = 180  # legacy absolute-age gate — deprecated 2026-09-03 (see OBS_* window below)
 OBS_MAX_LOOKBACK_SECONDS = 5400  # 90 min sanity: obs older than this = stale feed, do not fire
@@ -181,9 +182,18 @@ def update_running_extreme(state, city_id, market_local_date, direction, temp: f
     return rec
 
 
-def hour_ok(direction: str, local_hour: int, high_hour: int, low_hour_end: int) -> bool:
+def hour_ok(
+    direction: str,
+    local_hour: int,
+    high_hour: int,
+    low_hour_end: int,
+    high_hour_end: int | None = None,
+) -> bool:
+    """HIGH: [high_hour, high_hour_end) local hour window. LOW: hour <= low_hour_end."""
     if direction == "high":
-        return local_hour >= high_hour
+        if high_hour_end is None:
+            high_hour_end = 17
+        return high_hour <= local_hour < high_hour_end
     return local_hour <= low_hour_end
 
 
@@ -259,7 +269,8 @@ def maybe_arm_or_fire(
     max_jump = int(cfg.get("max_bucket_jump", MAX_BUCKET_JUMP))
     obs_lookback_s = int(cfg.get("max_obs_lookback_seconds", OBS_MAX_LOOKBACK_SECONDS))
     obs_future_s = int(cfg.get("max_obs_future_seconds", OBS_MAX_FUTURE_SECONDS))
-    high_hour = int(cfg.get("high_fire_local_hour", HIGH_FIRE_LOCAL_HOUR))
+    high_hour = int(cfg.get("high_fire_local_hour", cfg.get("high_fire_local_hour_start", HIGH_FIRE_LOCAL_HOUR)))
+    high_hour_end = int(cfg.get("high_fire_local_hour_end", HIGH_FIRE_LOCAL_HOUR_END))
     low_hour_end = int(cfg.get("low_fire_local_hour_end", LOW_FIRE_LOCAL_HOUR_END))
     min_obs_before_fire = int(cfg.get("min_obs_before_fire", 1))  # need prior sample so "new high" is real
 
@@ -353,7 +364,7 @@ def maybe_arm_or_fire(
     is_new_high = float(observed_temp) > prev_f + 1e-9 and running > prev_f + 1e-9
     if not is_new_high:
         # still track arm for fast poll near high season
-        if hour_ok(direction, local_hour, high_hour, low_hour_end) and key not in tree["fired"]:
+        if hour_ok(direction, local_hour, high_hour, low_hour_end, high_hour_end) and key not in tree["fired"]:
             tree["armed"][key] = {
                 "status": "armed",
                 "running": running,
@@ -400,7 +411,7 @@ def maybe_arm_or_fire(
         # Cap cascade depth; still allow fire but limit NO legs to max_jump buckets
         pass
 
-    if not hour_ok(direction, local_hour, high_hour, low_hour_end):
+    if not hour_ok(direction, local_hour, high_hour, low_hour_end, high_hour_end):
         return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key,
                  "jump": bucket_climb, "running": running}]
 

@@ -315,11 +315,64 @@ def _paper_fire(
             if match["avg_price"] is not None:
                 fills[intent["leg"]]["fill_price"] = str(match["avg_price"])
 
+    # --- Risk gates: hedge + min notional ------------------------------------
+    strat = cfg.get("strategy") or {}
+    yes_requires_no = bool(strat.get("yes_requires_no_fill", cfg.get("yes_requires_no_fill", True)))
+    min_notional = Decimal(str(
+        strat.get("min_fire_notional_usdc", cfg.get("min_fire_notional_usdc", "5"))
+    ))
+
+    no_filled = ZERO
+    yes_filled_cost = ZERO
+    yes_leg_names = []
+    for leg in fire.get("legs") or []:
+        name = str(leg.get("leg"))
+        outcome = str(leg.get("outcome") or "").upper()
+        side = str(leg.get("side") or "BUY").upper()
+        fl = fills.get(name) or {}
+        cost = fl.get("cost") or ZERO
+        shares = fl.get("shares") or ZERO
+        if side == "SELL":
+            continue
+        if outcome == "NO" or name.startswith("buy_no"):
+            no_filled += shares
+        if outcome == "YES" or name.startswith("buy_yes"):
+            yes_filled_cost += cost
+            yes_leg_names.append(name)
+
+    if yes_requires_no and yes_leg_names and no_filled <= ZERO:
+        # Strip YES fills — do not leave unhedged YES dust
+        for name in yes_leg_names:
+            if name in fills:
+                fills[name] = {"shares": ZERO, "cost": ZERO, "fill_price": None}
+        log_event(cfg.get("log_path"), {
+            "type": "fire_failed_no_hedge",
+            "key": fire.get("key"),
+            "note": "yes_requires_no_fill: no NO shares filled; YES discarded",
+            "yes_legs": yes_leg_names,
+        })
+        # If nothing left at all, fail the fire
+        if all((fills.get(str(l.get("leg"))) or {}).get("shares", ZERO) <= ZERO for l in (fire.get("legs") or [])):
+            return None, ladlog
+
     total_cost = sum((fills[k]["cost"] for k in fills), ZERO)
+
+    if total_cost > ZERO and total_cost < min_notional:
+        log_event(cfg.get("log_path"), {
+            "type": "fire_below_min_notional",
+            "key": fire.get("key"),
+            "total_cost": str(total_cost),
+            "min_notional": str(min_notional),
+        })
+        return None, ladlog
+
     # Fail closed: if we could not reserve the filled cost, stand the whole
     # fire down (do not record a position we cannot fund).
     if total_cost > ZERO and reserve(state, total_cost) is None:
         log_event(cfg.get("log_path"), {"type": "fire_insufficient_capital", "key": fire["key"], "need": str(total_cost)})
+        return None, ladlog
+    if total_cost <= ZERO:
+        # no fills after gates
         return None, ladlog
     # Start ledger baseline: paper_account debit already incremented by reserve.
 

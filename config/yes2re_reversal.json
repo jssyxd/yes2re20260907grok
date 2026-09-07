@@ -47,6 +47,12 @@
     "low_disabled": true,
     "sleeve_enabled": false,
     "min_obs_before_fire": 1,
-    "trigger": "metar_daily_new_high"
-  }
+    "trigger": "metar_daily_new_high",
+    "high_fire_local_hour_start": 14,
+    "high_fire_local_hour_end": 17,
+    "yes_requires_no_fill": true,
+    "min_fire_notional_usdc": 5.0
+  },
+  "min_fire_notional_usdc": 5.0,
+  "yes_requires_no_fill": true
 }

@@ -26,6 +26,9 @@ PAPER_CFG = {
     "high_fire_local_hour": 14,
     "max_bucket_jump": 3,
     "min_obs_before_fire": 1,
+    "high_fire_local_hour_end": 17,
+    "yes_requires_no_fill": True,
+    "min_fire_notional_usdc": 5.0,
 }
 
 

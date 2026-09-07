@@ -1,5 +1,15 @@
 # Changelog — yes2re20260907grok
 
+## 2026-09-07 — Risk gates: 14–17 local window, min $5, NO-hedge required
+
+- Local HIGH open window **[14, 17)** (`high_fire_local_hour_end=17`).
+- `min_fire_notional_usdc=5` — paper fire discarded if total fill cost < $5.
+- `yes_requires_no_fill=true` — if NO leg fills 0 shares, YES fills are zeroed
+  (`fire_failed_no_hedge`); no unhedged dust YES position.
+- Closes audit gaps from the kuala-lumpur $0.001 single-leg fire.
+
+# Changelog — yes2re20260907grok
+
 ## 2026-09-07 — Trigger rewrite: pure METAR daily new-high (first principles)
 
 - **Primary fire signal is only** “METAR posts a temperature strictly above
