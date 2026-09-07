@@ -1,44 +1,40 @@
 # STRATEGY — yes2re20260907grok
 
-## Edge thesis
+## Edge thesis (first principles)
 
-When live METAR proves the daily high has broken the reference extreme (TAF TX preferred, else market rank-1 consensus) by one or more buckets, the broken buckets are dead (NO → ~1 at settlement by temperature monotonicity). Buy NO on dead buckets and YES on the current proven high bucket before the book fully prices the break.
+Within a city's **IANA local calendar day**, when METAR posts a temperature
+**strictly higher than every previous observation today**, that reading is the
+**current known daily maximum**.
+
+If that new high lands in a **higher temperature bucket** than the previous
+running high:
+
+- Buckets **strictly below** the new-high bucket are dead for the daily HIGH market → buy **NO**
+- The **new-high bucket** is the current known max → buy **YES** (only if ask ≥ `yes_min_ask`)
+
+Edge = fact updated by METAR, books may lag.
+
+**Not used as a fire trigger:** TAF TX, market rank-1 “break the favourite”.
 
 ## Rules
 
-1. **Direction**: HIGH only. LOW is rejected at strategy entry and via config `directions_enabled`.
-2. **Reference**: TAF TX if available (converted to market unit); else 1–2h rank-1 YES consensus.
-3. **Jump**: up to `max_bucket_jump` (default 3). Market-ref oversized jumps still filtered when configured; TAF multi-jump allowed for cascade.
-4. **Legs**:
-   - NO on every broken bucket (cascade), cap **0.85**.
-   - YES only on **current** METAR-proven high bucket, cap from config, **min_ask 0.40** (no lottery).
-   - Notional NO:YES = **1:1**.
-5. **One logical fire per** `city|date|high` session (already_fired). Further breaks that require rolling YES are future work on top of this base; initial release fires cascade once per session.
-6. **Windows**: high local hour ≥ 14; obs sanity lookback 90min / future 15min.
-7. **Consensus**: broken bucket should be long-horizon rank-1 (configurable samples/window).
-8. **Execution**: in-memory L2 FAK, 8s budget, abort above cap.
+1. **Direction**: HIGH only (config + strategy hard reject LOW).
+2. **Primary signal**: METAR daily new high **and** bucket climb (`run_i > prev_i`).
+3. **Baseline**: first obs of the day only establishes running high (no fire).
+4. **Same-bucket new high**: skip (`new_high_same_bucket`) — dead set unchanged.
+5. **Legs**: cascade NO on dead buckets (depth ≤ `max_bucket_jump`); YES on current high with `min_ask` (default 0.40).
+6. **NO:YES notional**: 1:1; NO cap 0.85.
+7. **Further climb after fire**: `re_roll_yes` — SELL old YES FAK, NO on prior landing, YES on new high.
+8. **Windows**: local hour ≥ `high_fire_local_hour` (14); obs lookback 90min / future 15min.
+9. **Safety**: cross-midnight fail-closed, already_fired, duplicate_obs_time, max_open.
 
 ## Explicitly disabled
 
 - LOW markets
-- B2 pre-breach sleeve
-- YES fills below 0.40 ask
-- Live / wallet paths
-
-## Safety (from 2026-09 paper incidents)
-
-- `stale_market_date` fail-closed (bad tz → skip, never self-disable)
-- prune keeps `fired` marker while position still open (prevents cross-midnight re-fire loop)
-- `already_fired` / duplicate_obs_time guards
-- book warm path before fire when available
-
-## What this release does *not* yet fully automate
-
-Rolling YES on **further** breaks within the same session (sell prior YES FAK → buy new dead NO → buy newest YES) is specified as the intended behaviour; the first ship focuses on correct first-fire cascade + safety. Track as follow-up if paper evidence shows frequent multi-step highs.
-
+- B2 sleeve
+- TAF / rank-1 as primary break trigger
+- YES fills with best_ask < 0.40
 
 ## Lottery YES (forbidden)
 
-Execution enforces `yes_min_ask` (default **0.40**). If best_ask on the new-high YES token is below the floor, the leg returns `abort_below_min_ask` and does not fill.
-
-**Intended edge (not dust):** the reference high bucket should have been a *real* market consensus for ~1–2h (meaningful YES TWAP, not 0.001). METAR then proves a break into the next bucket; that new YES is fought over and re-prices quickly. A fire whose rank-1 / new YES is already at dust prices is not this edge — it is a late or thin-book artifact.
+Execution enforces `yes_min_ask` (default **0.40**). Below floor → `abort_below_min_ask`.

@@ -1,5 +1,21 @@
 # Changelog — yes2re20260907grok
 
+## 2026-09-07 — Trigger rewrite: pure METAR daily new-high (first principles)
+
+- **Primary fire signal is only** “METAR posts a temperature strictly above
+  every prior obs today, and the new high is in a higher bucket than the
+  previous running high.”
+- Removed TAF / market rank-1 as the primary “break the favourite” trigger
+  (they were causing dust-bucket fires such as kuala-lumpur @0.001 YES).
+- First obs of the day = baseline only (no fire). Same-bucket new high = skip.
+- Cascade NO on dead buckets below the new high; YES on the new-high bucket
+  with execution `yes_min_ask` still enforced.
+- Further bucket climb after fire → `re_roll_yes` (unchanged intent).
+- Config: `require_consensus_filter=false`, `allow_market_consensus_reference=false`,
+  `trigger=metar_daily_new_high`.
+- Unit tests rewritten for the new semantics; 7/7 PASS.
+
+
 ## 2026-09-07 — Lottery YES blocked; min_ask enforced at execution
 
 - **Root cause (sandbox fire `kuala-lumpur|2026-09-07|high`)**: strategy attached

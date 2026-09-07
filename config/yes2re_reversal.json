@@ -19,7 +19,9 @@
   "log_path": "data/yes2re_events.jsonl",
   "health_path": "data/yes2re_health.json",
   "market_ws_enabled": true,
-  "directions_enabled": ["high"],
+  "directions_enabled": [
+    "high"
+  ],
   "strategy": {
     "arm_c": 1.0,
     "max_bucket_jump": 3,
@@ -31,11 +33,11 @@
     "yes_notional_pct": "0.50",
     "yes_leg_enabled": true,
     "require_fresh_obs_seconds": 180,
-    "require_consensus_filter": true,
+    "require_consensus_filter": false,
     "consensus_window_seconds": 7200,
     "consensus_min_samples": 12,
     "consensus_min_lead": "0.03",
-    "allow_market_consensus_reference": true,
+    "allow_market_consensus_reference": false,
     "high_fire_local_hour": 14,
     "low_fire_local_hour_end": 0,
     "fast_poll_seconds": 8,
@@ -43,6 +45,8 @@
     "max_obs_lookback_seconds": 5400,
     "max_obs_future_seconds": 900,
     "low_disabled": true,
-    "sleeve_enabled": false
+    "sleeve_enabled": false,
+    "min_obs_before_fire": 1,
+    "trigger": "metar_daily_new_high"
   }
 }

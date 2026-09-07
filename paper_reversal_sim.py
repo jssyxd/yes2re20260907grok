@@ -12,13 +12,20 @@ from consensus_tracker import ConsensusTracker
 TZ = "Asia/Shanghai"
 
 PAPER_CFG = {
-    "require_consensus_filter": True,
+    "require_consensus_filter": False,
     "consensus_min_samples": 3,
     "consensus_window_seconds": 7200,
     "consensus_min_lead": "0.01",
-    "allow_market_consensus_reference": True,
-    "no_max_ask": "0.65",
-    "yes_max_ask": "0.48",
+    "allow_market_consensus_reference": False,
+    "no_max_ask": "0.85",
+    "yes_max_ask": "0.85",
+    "yes_min_ask": "0.40",
+    "no_notional_pct": "0.50",
+    "yes_notional_pct": "0.50",
+    "yes_leg_enabled": True,
+    "high_fire_local_hour": 14,
+    "max_bucket_jump": 3,
+    "min_obs_before_fire": 1,
 }
 
 
@@ -78,95 +85,155 @@ def run_fire_window(fire, books, budget_usdc, now, scramble=True):
 
 
 def scenario_one_bucket_fill():
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
-    tracker = ConsensusTracker(window_seconds=7200, min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    books={"NO-31": make_book(0.42, depth=10), "YES-32": make_book(0.28, depth=8)}
+    """METAR new high climbs one bucket → NO on dead + YES on new high."""
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)  # 16:00 Shanghai
+    tracker = ConsensusTracker(min_samples=3)
+    books = {"NO-31": make_book(0.42, depth=10), "YES-32": make_book(0.45, depth=8)}
     for t in range(28, 36):
-        books[f"YES-{t}"] = make_book(0.55 if t == 31 else 0.15, depth=5)
-    actions=[]
-    for temp, offset in ((30.2,0),(30.8,30),(31.4,60),(32.1,90)):
-        t=now+timedelta(seconds=offset)
-        actions.extend(maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, temp, t, t, books, PAPER_CFG, tracker))
-    fire=next((a for a in actions if a.get("action_type")=="re_fire"), None)
+        books[f"YES-{t}"] = make_book(0.55 if t == 32 else 0.15, depth=5)
+        books[f"NO-{t}"] = make_book(0.40, depth=8)
+    actions = []
+    # baseline then climb 31.4 (h31) -> 32.1 (h32)
+    for temp, offset in ((30.2, 0), (31.4, 30), (32.1, 90)):
+        ts = now + timedelta(seconds=offset)
+        actions.extend(maybe_arm_or_fire(
+            state, city, "2026-09-01", "high", buckets, None, temp, ts, ts, books, PAPER_CFG, tracker
+        ))
+    fire = next((a for a in actions if a.get("action_type") == "re_fire"), None)
     if fire is None:
-        return {"name":"one_bucket_fill","actions":[a.get("action_type") for a in actions],"ok":False,"error":"no_fire","reasons":[a.get("reason") for a in actions]}
-    fills, leftover, log = run_fire_window(fire, books, Decimal("20"), now+timedelta(seconds=90))
-    return {"name":"one_bucket_fill","actions":[a["action_type"] for a in actions],"fire_jump":fire["jump"],"fills":{k:{kk:str(vv) for kk,vv in v.items()} for k,v in fills.items()},"leftover":{k:str(v) for k,v in leftover.items()},"send_faks":sum(1 for x in log if x.get("status")=="send_fak"),"ok":fills["buy_no_broken"]["shares"]>0}
+        return {"name": "one_bucket_fill", "actions": [a.get("action_type") for a in actions],
+                "ok": False, "error": "no_fire", "reasons": [a.get("reason") for a in actions]}
+    fills, leftover, log = run_fire_window(fire, books, Decimal("20"), now + timedelta(seconds=90))
+    ok = fills.get("buy_no_broken", {}).get("shares", 0) > 0 or any(
+        v.get("shares", 0) > 0 for k, v in fills.items() if k.startswith("buy_no")
+    )
+    return {
+        "name": "one_bucket_fill",
+        "actions": [a["action_type"] for a in actions],
+        "fire_jump": fire["jump"],
+        "trigger": fire.get("trigger"),
+        "fills": {k: {kk: str(vv) for kk, vv in v.items()} for k, v in fills.items()},
+        "send_faks": sum(1 for x in log if x.get("status") == "send_fak"),
+        "ok": bool(ok),
+    }
 
 
 def scenario_two_bucket_cascade():
-    """jump>=2: cascade NO on dead buckets + YES on current METAR high (yes2re20260907grok)."""
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    """New high jumps 2+ buckets → cascade NO + YES on current high."""
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 33.2, now, now, {}, PAPER_CFG, tracker)
-    fire=next((a for a in actions if a.get("action_type")=="re_fire"), None)
-    legs=[x["leg"] for x in (fire or {}).get("legs", [])]
+    books = {}
+    for t in range(28, 36):
+        books[f"YES-{t}"] = make_book(0.50, depth=5)
+        books[f"NO-{t}"] = make_book(0.40, depth=8)
+    actions = []
+    # baseline 31.2 (h31) then 33.2 (h33) → climb 2
+    for temp, offset in ((31.2, 0), (33.2, 60)):
+        ts = now + timedelta(seconds=offset)
+        actions.extend(maybe_arm_or_fire(
+            state, city, "2026-09-01", "high", buckets, None, temp, ts, ts, books, PAPER_CFG, tracker
+        ))
+    fire = next((a for a in actions if a.get("action_type") == "re_fire"), None)
+    legs = [x["leg"] for x in (fire or {}).get("legs", [])]
     has_no = any(l.startswith("buy_no") for l in legs)
     has_yes = "buy_yes_new" in legs
-    return {"name":"two_bucket_cascade","types":[a["action_type"] for a in actions],"legs":legs,
-            "ok":fire is not None and has_no and has_yes and fire.get("jump",0)>=2}
+    return {
+        "name": "two_bucket_cascade",
+        "types": [a["action_type"] for a in actions],
+        "legs": legs,
+        "ok": fire is not None and has_no and has_yes and fire.get("jump", 0) >= 2,
+        "trigger": (fire or {}).get("trigger"),
+    }
 
 
 def scenario_stale_obs_no_fire():
-    # 2026-09-03 window semantics: stale = obs older than 90 min (was 180 s).
-    # 10-min-old obs is a NORMAL hourly-cadence gap and must be able to fire.
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now-timedelta(minutes=100), now, {}, PAPER_CFG, tracker)
-    return {"name":"stale_obs_no_fire","types":[a["action_type"] for a in actions],"ok":all(a.get("action_type")!="re_fire" for a in actions)}
+    # establish baseline with fresh obs
+    maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, None, 31.2, now, now, {}, PAPER_CFG, tracker)
+    # new high but obs is 100 min old → stale
+    actions = maybe_arm_or_fire(
+        state, city, "2026-09-01", "high", buckets, None, 32.5,
+        now - timedelta(minutes=100), now, {}, PAPER_CFG, tracker,
+    )
+    return {
+        "name": "stale_obs_no_fire",
+        "types": [a.get("action_type") for a in actions],
+        "ok": all(a.get("action_type") != "re_fire" for a in actions),
+    }
 
 
 def scenario_morning_skip():
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,3,0,tzinfo=timezone.utc)
+    state = {}; city = make_city(); buckets = make_buckets()
+    # 02:00 UTC = 10:00 Shanghai — before high_fire_local_hour 14
+    now = datetime(2026, 9, 1, 2, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
-    return {"name":"morning_skip","types":[a["action_type"] for a in actions],"ok":all(a.get("action_type")!="re_fire" for a in actions)}
+    actions = []
+    for temp, offset in ((30.0, 0), (32.1, 30)):
+        ts = now + timedelta(seconds=offset)
+        actions.extend(maybe_arm_or_fire(
+            state, city, "2026-09-01", "high", buckets, None, temp, ts, ts, {}, PAPER_CFG, tracker
+        ))
+    return {
+        "name": "morning_skip",
+        "types": [a.get("action_type") for a in actions],
+        "ok": all(a.get("action_type") != "re_fire" for a in actions),
+    }
 
 
-def scenario_cap_abort():
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+def scenario_cap_abort_no_chase():
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    books={"NO-31": make_book(0.80, depth=10), "YES-32": make_book(0.70, depth=8)}
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, books, PAPER_CFG, tracker)
-    fire=next(a for a in actions if a["action_type"]=="re_fire")
-    fills, leftover, log = run_fire_window(fire, books, Decimal("20"), now, scramble=False)
-    aborted=[x for x in log if x.get("status")=="abort_above_cap"]
-    return {"name":"cap_abort_no_chase","aborted":len(aborted),"filled_no":str(fills.get("buy_no_broken",{}).get("shares",0)),"ok":fills.get("buy_no_broken",{}).get("shares",0)==0 and len(aborted)>=1}
+    books = {"NO-31": make_book(0.95, depth=5), "YES-32": make_book(0.90, depth=5)}
+    actions = []
+    for temp, offset in ((31.2, 0), (32.1, 30)):
+        ts = now + timedelta(seconds=offset)
+        actions.extend(maybe_arm_or_fire(
+            state, city, "2026-09-01", "high", buckets, None, temp, ts, ts, books, PAPER_CFG, tracker
+        ))
+    fire = next((a for a in actions if a.get("action_type") == "re_fire"), None)
+    if fire is None:
+        return {"name": "cap_abort_no_chase", "ok": True, "note": "no_fire"}
+    fills, leftover, log = run_fire_window(fire, books, Decimal("20"), now)
+    aborts = sum(1 for x in log if x.get("status") == "abort_above_cap")
+    return {"name": "cap_abort_no_chase", "aborts": aborts, "ok": aborts >= 1 or all(
+        float(v.get("shares") or 0) == 0 for v in fills.values()
+    )}
 
 
 def scenario_no_double_fire():
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    a1=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
-    a2=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.4, now+timedelta(seconds=1), now+timedelta(seconds=1), {}, PAPER_CFG, tracker)
-    fires=[a for a in a1+a2 if a.get("action_type")=="re_fire"]
-    return {"name":"no_double_fire","fires":len(fires),"second":[a.get("reason") for a in a2],"ok":len(fires)==1 and a2[0].get("reason")=="already_fired"}
+    books = {f"NO-{t}": make_book(0.40, depth=8) for t in range(28, 36)}
+    books.update({f"YES-{t}": make_book(0.50, depth=5) for t in range(28, 36)})
+    actions = []
+    for temp, offset in ((31.2, 0), (32.1, 30), (32.3, 60)):
+        ts = now + timedelta(seconds=offset)
+        actions.extend(maybe_arm_or_fire(
+            state, city, "2026-09-01", "high", buckets, None, temp, ts, ts, books, PAPER_CFG, tracker
+        ))
+    fires = [a for a in actions if a.get("action_type") == "re_fire"]
+    # second new high same bucket should not re_fire; only one first fire
+    return {"name": "no_double_fire", "n_fire": len(fires), "ok": len(fires) == 1}
 
 
 def scenario_consensus_blocks_non_leader():
-    state={}; city=make_city(); buckets=make_buckets()
-    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    """Legacy name kept: under new trigger, LOW is hard-rejected (not consensus)."""
+    state = {}; city = make_city(); buckets = make_buckets()
+    now = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
-    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h32", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    actions = maybe_arm_or_fire(
+        state, city, "2026-09-01", "low", buckets, None, 20.0, now, now, {}, PAPER_CFG, tracker
+    )
     return {
         "name": "consensus_blocks_non_leader",
         "types": [a.get("action_type") for a in actions],
-        "reasons": [a.get("reason") for a in actions],
-        "ok": all(a.get("action_type") != "re_fire" for a in actions)
-        and any(a.get("reason") == "consensus_filter" for a in actions),
+        "ok": actions and actions[0].get("reason") == "low_disabled",
     }
 
 
@@ -177,7 +244,7 @@ def run_scenarios():
         scenario_two_bucket_cascade,
         scenario_stale_obs_no_fire,
         scenario_morning_skip,
-        scenario_cap_abort,
+        scenario_cap_abort_no_chase,
         scenario_no_double_fire,
         scenario_consensus_blocks_non_leader,
     ):

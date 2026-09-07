@@ -1,15 +1,19 @@
-"""METAR-vs-TAF one-bucket reversal with long-horizon consensus filter.
+"""Daily METAR new-high trigger (yes2re20260907grok first principles).
 
-IDLE -> ARMED -> FIRED -> COOLDOWN
+Primary signal (only):
+  Within the city's IANA local calendar day, a METAR observation posts a
+  temperature strictly higher than every previous obs today (new daily high).
+  If that new high lands in a *higher* temperature bucket than the previous
+  running high, fire:
 
-Fire only when:
-  1) running extreme breaks the reference extreme by exactly one bucket
-     (reference = TAF TX/TN if present, else market rank-1 consensus bucket)
-  2) obs is fresh (new obs_time, age <= require_fresh_obs_seconds)
-  3) local hour in fire window
-  4) broken bucket was long-horizon market consensus (1–2h TWAP rank-1)
+    - NO on every bucket strictly below the new-high bucket (now dead)
+    - YES on the new-high bucket (current known daily max)
 
-NO leg on broken bucket is the main trade; YES on new bucket is optional and smaller.
+No TAF / market rank-1 "break the favourite" primary trigger.
+Quality gates: HIGH-only, local hour window, obs sanity, already_fired /
+further-break YES roll, yes_min_ask (execution), max_open, cross-midnight.
+
+IDLE -> ARMED (running high established) -> FIRED (bucket climb on new high)
 """
 from __future__ import annotations
 
@@ -236,184 +240,192 @@ def maybe_arm_or_fire(
     config: dict[str, Any] | None = None,
     consensus_tracker: ConsensusTracker | None = None,
 ) -> list[dict[str, Any]]:
-    """Main hook: call on every new METAR observation timestamp.
+    """METAR daily new-high primary trigger.
 
-    Always samples books into consensus_tracker when provided so the
-    long-horizon rank filter has data before a break.
+    ``taf_extreme`` is accepted for API compatibility but is NOT used as a
+    fire trigger. ``consensus_tracker`` is still sampled for optional
+    diagnostics / future soft filters.
     """
     actions: list[dict[str, Any]] = []
     if observed_temp is None:
         return actions
-    # HARD REJECT: LOW markets disabled (yes2re20260907grok — HIGH only)
+
+    # HARD REJECT: LOW markets disabled
     if str(direction).lower() == "low":
-        return [{"action_type": "re_skip", "reason": "low_disabled", "key": session_key(city["city_id"], market_local_date, direction)}]
+        return [{"action_type": "re_skip", "reason": "low_disabled",
+                 "key": session_key(city["city_id"], market_local_date, direction)}]
+
     cfg = config or {}
-    arm_c = float(cfg.get("arm_c", ARM_C))
     max_jump = int(cfg.get("max_bucket_jump", MAX_BUCKET_JUMP))
-    fresh_s = int(cfg.get("require_fresh_obs_seconds", REQUIRE_FRESH_OBS_SECONDS))  # legacy, unused by fire window
     obs_lookback_s = int(cfg.get("max_obs_lookback_seconds", OBS_MAX_LOOKBACK_SECONDS))
     obs_future_s = int(cfg.get("max_obs_future_seconds", OBS_MAX_FUTURE_SECONDS))
     high_hour = int(cfg.get("high_fire_local_hour", HIGH_FIRE_LOCAL_HOUR))
     low_hour_end = int(cfg.get("low_fire_local_hour_end", LOW_FIRE_LOCAL_HOUR_END))
-    cons_win = int(cfg.get("consensus_window_seconds", CONSENSUS_WINDOW_SECONDS))
-    cons_min_samples = int(cfg.get("consensus_min_samples", CONSENSUS_MIN_SAMPLES))
-    cons_min_lead = Decimal(str(cfg.get("consensus_min_lead", CONSENSUS_MIN_LEAD)))
-    require_consensus = bool(cfg.get("require_consensus_filter", True))
-    allow_market_ref = bool(cfg.get("allow_market_consensus_reference", True))
+    min_obs_before_fire = int(cfg.get("min_obs_before_fire", 1))  # need prior sample so "new high" is real
 
-    tracker = consensus_tracker or DEFAULT_TRACKER
     tree = ensure_re_state(state)
     key = session_key(city["city_id"], market_local_date, direction)
 
-    # Cross-midnight date guard (2026-09-06 incident): a session whose market
-    # local date is no longer the city's local TODAY must never arm/fire. When
-    # a market day rolls over (e.g. chicago 09-05 -> 09-06 at 05:00Z), prune
-    # deletes yesterday's fired marker every cycle but the rules cache (TTL'd)
-    # still lists the old-date rule — so the same breach observation re-fires
-    # on every cycle (~$230/min paper burn on both A/B arms). Skipping stale
-    # dates here closes the loop: prune keeps cleaning, nothing re-fires.
+    # Cross-midnight fail-closed
     try:
         city_tz = city.get("timezone")
         if not city_tz:
             raise ValueError("city missing timezone")
         local_today = now_utc.astimezone(ZoneInfo(city_tz)).date().isoformat()
-    except Exception:  # noqa: BLE001 — bad/missing tz: FAIL CLOSED. "Today" in
-        # the city's tz cannot be verified, so never arm/fire (the previous
-        # fallback set local_today = market_local_date, which self-disabled the
-        # guard and re-opened the 2026-09-06 stale-date re-fire path for any
-        # city whose tz entry ever broke or went missing).
+    except Exception:
         return [{"action_type": "re_skip", "reason": "stale_market_date",
                  "key": key, "guard": "tz_unresolvable"}]
     if market_local_date != local_today:
         return [{"action_type": "re_skip", "reason": "stale_market_date", "key": key}]
 
-    # Continuous consensus sampling (even before break)
-    tracker.record_books(
-        city["city_id"],
-        market_local_date,
-        direction,
-        buckets,
-        books_by_token,
-        now_utc,
-    )
+    # Optional consensus sampling (diagnostic only — not a fire gate)
+    tracker = consensus_tracker or DEFAULT_TRACKER
+    try:
+        tracker.record_books(
+            city["city_id"], market_local_date, direction,
+            buckets, books_by_token, now_utc,
+        )
+    except Exception:
+        pass
 
-    # Already-fired: default skip, BUT allow further-break YES roll when the
-    # running high has moved into a new higher bucket than last fire.
-    if key in tree["fired"]:
-        fired_rec = tree["fired"].get(key) or {}
-        last_run = fired_rec.get("running_extreme")
-        last_bucket = fired_rec.get("new_bucket_id")
-        # Fall through only if we can detect a higher break; else skip.
-        # Actual roll decision is computed after running_extreme update below.
-        pass  # defer to post-update roll check
-    else:
-        fired_rec = None
-
-    # Open-position cap: never open a new position while the number of
-    # unsettled paper positions is at/over max_open_positions. Prevents
-    # unbounded concurrent exposure when fires fill but settlements lag
-    # (max_open_positions previously existed only as a DEFAULTS entry with no
-    # enforcement — positions could stack past the cap).
+    # max_open (only for first fire, not roll)
     max_open = int(cfg.get("max_open_positions") or 0)
     if max_open > 0 and key not in tree["fired"]:
-        open_count = sum(
-            1 for p in (state.get("positions") or {}).values()
-            if not p.get("settled")
-        )
+        open_count = sum(1 for p in (state.get("positions") or {}).values() if not p.get("settled"))
         if open_count >= max_open:
             return [{"action_type": "re_skip", "reason": "max_open_positions",
                      "key": key, "open": open_count, "cap": max_open}]
 
-    # Duplicate obs_time guard (must run after fired check so we still record books)
+    # New observation only
     if not is_new_obs_time(state, key, obs_time_utc):
         return [{"action_type": "re_skip", "reason": "duplicate_obs_time", "key": key}]
 
+    # Obs age sanity
+    if obs_time_utc is not None:
+        age_s = (now_utc - obs_time_utc).total_seconds()
+        if age_s > obs_lookback_s:
+            return [{"action_type": "re_skip", "reason": "stale_obs", "key": key, "age_s": age_s}]
+        if age_s < -obs_future_s:
+            return [{"action_type": "re_skip", "reason": "obs_in_future", "key": key, "age_s": age_s}]
+
     local_hour = now_utc.astimezone(ZoneInfo(city["timezone"])).hour
+    ordered = ordered_buckets(buckets)
+
+    # Previous running high BEFORE this update
+    prev_rec = (tree.get("running_extremes") or {}).get(key) or {}
+    prev_val = prev_rec.get("value")
+    prev_obs_count = int(prev_rec.get("obs_count") or 0)
+
     rec = update_running_extreme(
         state, city["city_id"], market_local_date, direction, float(observed_temp), now_utc
     )
     running = float(rec["value"])
-    ordered = ordered_buckets(buckets)
-
-    # Reference extreme: prefer TAF; fallback to market rank-1 mid
-    ref_source = "taf"
-    ref_extreme = float(taf_extreme) if taf_extreme is not None else None
-    taf_b = find_bucket(ordered, float(taf_extreme)) if taf_extreme is not None else None
-    if taf_b is None and allow_market_ref:
-        ref_extreme, taf_b, ref_source = reference_extreme_from_consensus(
-            tracker,
-            city["city_id"],
-            market_local_date,
-            direction,
-            ordered,
-            now_utc,
-            cons_win,
-        )
-    if ref_extreme is None or taf_b is None:
-        return [{"action_type": "re_skip", "reason": "no_reference_extreme", "key": key, "ref_source": ref_source}]
+    obs_count = int(rec.get("obs_count") or 0)
 
     run_b = find_bucket(ordered, running)
-    taf_i = bucket_index(ordered, taf_b)
     run_i = bucket_index(ordered, run_b)
-    if taf_i is None or run_i is None:
-        return [{"action_type": "re_skip", "reason": "bucket_unmapped", "key": key}]
+    if run_i is None or run_b is None:
+        return [{"action_type": "re_skip", "reason": "bucket_unmapped", "key": key, "running": running}]
 
-    distance_c = abs(running - float(ref_extreme))
-    jump = run_i - taf_i if direction == "high" else taf_i - run_i
-
-    armed = tree["armed"].get(key)
-    if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_hour, low_hour_end):
+    # --- Not a new daily high? -------------------------------------------------
+    # First sample of the day: establish baseline only, never fire.
+    if prev_val is None:
         tree["armed"][key] = {
             "status": "armed",
-            "taf_bucket_id": str(taf_b.get("bucket_id") or taf_b.get("id") or ""),
-            "ref_extreme": float(ref_extreme),
-            "ref_source": ref_source,
             "running": running,
+            "bucket_id": str(run_b.get("bucket_id") or run_b.get("id") or ""),
             "armed_at_utc": iso_utc(now_utc),
             "fast_poll": True,
+            "trigger": "metar_baseline",
         }
         actions.append({
             "action_type": "re_arm",
             "key": key,
-            "distance_c": distance_c,
-            "ref_source": ref_source,
-            "taf_bucket_id": tree["armed"][key]["taf_bucket_id"],
+            "running": running,
+            "reason": "baseline_high_established",
             "prefetch_tokens": True,
             "fast_poll": True,
             "fast_poll_seconds": int(cfg.get("fast_poll_seconds", 8)),
         })
         return actions
 
-    if jump <= 0:
-        if armed and distance_c > arm_c + 0.7:
-            tree["armed"].pop(key, None)
-            actions.append({"action_type": "re_disarm", "key": key, "reason": "moved_away"})
+    prev_f = float(prev_val)
+    is_new_high = float(observed_temp) > prev_f + 1e-9 and running > prev_f + 1e-9
+    if not is_new_high:
+        # still track arm for fast poll near high season
+        if hour_ok(direction, local_hour, high_hour, low_hour_end) and key not in tree["fired"]:
+            tree["armed"][key] = {
+                "status": "armed",
+                "running": running,
+                "bucket_id": str(run_b.get("bucket_id") or run_b.get("id") or ""),
+                "armed_at_utc": iso_utc(now_utc),
+                "fast_poll": True,
+                "trigger": "metar_running",
+            }
+            actions.append({
+                "action_type": "re_arm",
+                "key": key,
+                "running": running,
+                "reason": "running_high_hold",
+                "prefetch_tokens": True,
+                "fast_poll": True,
+                "fast_poll_seconds": int(cfg.get("fast_poll_seconds", 8)),
+            })
         return actions
 
-    # jump > 0 : potential break
-    if not hour_ok(direction, local_hour, high_hour, low_hour_end):
-        return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key, "jump": jump}]
+    # --- New daily high observed ----------------------------------------------
+    prev_b = find_bucket(ordered, prev_f)
+    prev_i = bucket_index(ordered, prev_b)
+    if prev_i is None:
+        # previous high unmapped — treat as baseline refresh
+        tree["armed"][key] = {
+            "status": "armed", "running": running,
+            "bucket_id": str(run_b.get("bucket_id") or run_b.get("id") or ""),
+            "armed_at_utc": iso_utc(now_utc), "fast_poll": True, "trigger": "metar_new_high_unmapped_prev",
+        }
+        return [{"action_type": "re_arm", "key": key, "running": running, "reason": "new_high_prev_unmapped"}]
 
-    # --- Further-break YES roll (same session already fired) -----------------
-    # If we already fired and the running high has moved into a *new* higher
-    # bucket than last fire's new_bucket_id, emit: sell prior YES (FAK discount),
-    # buy NO on newly broken bucket(s), buy YES on current high.
+    bucket_climb = run_i - prev_i  # high direction: positive = climbed
+    if bucket_climb <= 0:
+        # New high but still same (or lower-mapped) bucket — no dead-bucket change
+        tree["armed"][key] = {
+            "status": "armed", "running": running,
+            "bucket_id": str(run_b.get("bucket_id") or run_b.get("id") or ""),
+            "armed_at_utc": iso_utc(now_utc), "fast_poll": True, "trigger": "metar_new_high_same_bucket",
+        }
+        return [{"action_type": "re_skip", "reason": "new_high_same_bucket", "key": key,
+                 "running": running, "prev": prev_f, "bucket_id": str(run_b.get("bucket_id") or run_b.get("id") or "")}]
+
+    if bucket_climb > max_jump:
+        # Cap cascade depth; still allow fire but limit NO legs to max_jump buckets
+        pass
+
+    if not hour_ok(direction, local_hour, high_hour, low_hour_end):
+        return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key,
+                 "jump": bucket_climb, "running": running}]
+
+    if prev_obs_count < min_obs_before_fire:
+        return [{"action_type": "re_skip", "reason": "insufficient_prior_obs", "key": key,
+                 "obs_count": prev_obs_count, "need": min_obs_before_fire}]
+
+    yes_cap = Decimal(str(cfg.get("yes_max_ask", YES_MAX_ASK)))
+    yes_floor = Decimal(str(cfg.get("yes_min_ask", "0.40")))
+    no_cap = str(cfg.get("no_max_ask", NO_MAX_ASK))
+    no_pct = Decimal(str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)))
+    yes_pct = Decimal(str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT)))
+    fire_yes = bool(cfg.get("yes_leg_enabled", True))
+
+    new_bucket_id = str(run_b.get("bucket_id") or run_b.get("id") or "")
+    new_yes_token = run_b.get("yes_token_id") or run_b.get("_yes_token_id")
+
+    # ---- Further-break roll if already fired ---------------------------------
     if key in tree["fired"]:
-        prev = tree["fired"].get(key) or {}
-        prev_bucket_id = str(prev.get("new_bucket_id") or "")
-        cur_bucket_id = str(run_b.get("bucket_id") or run_b.get("id") or "") if run_b else ""
-        prev_run = prev.get("running_extreme")
-        if not cur_bucket_id or cur_bucket_id == prev_bucket_id:
+        prev_fire = tree["fired"].get(key) or {}
+        prev_bucket_id = str(prev_fire.get("new_bucket_id") or "")
+        if prev_bucket_id == new_bucket_id:
             return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
-        if prev_run is not None and float(running) <= float(prev_run) + 1e-9:
-            return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
-        # Higher break confirmed — build roll action
-        yes_cap = str(cfg.get("yes_max_ask", YES_MAX_ASK))
-        yes_floor = Decimal(str(cfg.get("yes_min_ask", "0.40")))
-        no_cap = str(cfg.get("no_max_ask", NO_MAX_ASK))
-        no_pct = str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT))
-        yes_pct = str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT))
-        sell_slip = str(cfg.get("yes_roll_sell_slip", "0.05"))  # FAK discount from best bid
+        # climbed further → roll YES
+        sell_slip = str(cfg.get("yes_roll_sell_slip", "0.05"))
         roll = {
             "action_type": "re_roll_yes",
             "key": key,
@@ -422,178 +434,65 @@ def maybe_arm_or_fire(
             "market_local_date": market_local_date,
             "direction": direction,
             "prev_bucket_id": prev_bucket_id,
-            "new_bucket_id": cur_bucket_id,
-            "prev_running": prev_run,
+            "new_bucket_id": new_bucket_id,
+            "prev_running": prev_fire.get("running_extreme"),
             "running_extreme": running,
-            "jump": jump,
+            "jump": bucket_climb,
+            "trigger": "metar_new_high_roll",
             "legs": [],
             "fire_budget_ms": int(cfg.get("fire_budget_ms", 8000)),
         }
-        # Sell prior YES (token from position if present)
         pos = (state.get("positions") or {}).get(key) or {}
         prev_yes_token = None
         for leg in (pos.get("legs") or []):
             if isinstance(leg, dict) and (
-                leg.get("leg") == "buy_yes_new" or str(leg.get("outcome","")).upper() == "YES"
+                leg.get("leg") == "buy_yes_new" or str(leg.get("outcome", "")).upper() == "YES"
             ):
                 prev_yes_token = leg.get("token_id")
                 break
         if prev_yes_token is None:
-            prev_yes_token = prev.get("new_yes_token")
+            prev_yes_token = prev_fire.get("new_yes_token")
         if prev_yes_token:
             roll["legs"].append({
-                "leg": "sell_yes_old",
-                "token_id": prev_yes_token,
-                "side": "SELL",
-                "outcome": "YES",
-                "cap": sell_slip,  # interpreted as max slip from bid in exec
-                "notional_pct": "1.0",
-                "roll": True,
+                "leg": "sell_yes_old", "token_id": prev_yes_token, "side": "SELL",
+                "outcome": "YES", "cap": sell_slip, "notional_pct": "1.0", "roll": True,
             })
-        # NO on newly broken (previous landing bucket is now dead)
+        # NO on previous landing bucket (now dead)
         if prev_bucket_id:
-            # find no token for prev landing bucket
             for b in ordered:
-                bid = str(b.get("bucket_id") or b.get("id") or "")
-                if bid == prev_bucket_id:
+                if str(b.get("bucket_id") or b.get("id") or "") == prev_bucket_id:
                     tok = b.get("no_token_id") or b.get("_no_token_id")
                     if tok:
                         roll["legs"].append({
-                            "leg": "buy_no_broken",
-                            "token_id": tok,
-                            "side": "BUY",
-                            "outcome": "NO",
-                            "cap": no_cap,
-                            "notional_pct": no_pct,
-                            "roll": True,
+                            "leg": "buy_no_broken", "token_id": tok, "side": "BUY",
+                            "outcome": "NO", "cap": no_cap, "notional_pct": str(no_pct), "roll": True,
                         })
                     break
-        # YES on current high
-        new_yes = (run_b.get("yes_token_id") or run_b.get("_yes_token_id")) if run_b else None
-        if new_yes and Decimal(str(cfg.get("yes_max_ask", YES_MAX_ASK))) >= yes_floor:
+        if fire_yes and new_yes_token and yes_cap >= yes_floor:
             roll["legs"].append({
-                "leg": "buy_yes_new",
-                "token_id": new_yes,
-                "side": "BUY",
-                "outcome": "YES",
-                "cap": yes_cap,
-                "notional_pct": yes_pct,
-                "min_ask": str(yes_floor),
-                "roll": True,
+                "leg": "buy_yes_new", "token_id": new_yes_token, "side": "BUY",
+                "outcome": "YES", "cap": str(yes_cap), "notional_pct": str(yes_pct),
+                "min_ask": str(yes_floor), "roll": True,
             })
         tree["fired"][key] = {
-            "status": "fired_roll",
-            "at_utc": iso_utc(now_utc),
-            "jump": jump,
-            "running_extreme": running,
-            "new_bucket_id": cur_bucket_id,
-            "new_yes_token": new_yes,
-            "prev_bucket_id": prev_bucket_id,
-            "roll": True,
+            "status": "fired_roll", "at_utc": iso_utc(now_utc),
+            "jump": bucket_climb, "running_extreme": running,
+            "new_bucket_id": new_bucket_id, "new_yes_token": new_yes_token,
+            "prev_bucket_id": prev_bucket_id, "trigger": "metar_new_high_roll",
         }
         actions.append(roll)
         return actions
 
-    # Freshness = "a NEW observation arrived" (deduped by is_new_obs_time
-    # above) — NOT "the observation happened within N seconds". METAR/SPECI
-    # run on a 20-60 min cadence: obs_time age swings 0-60 min between
-    # reports by design (US AWS publish ~7 min EARLY, others 1-8 min late).
-    # An absolute age gate (<=180s) structurally killed every fire with
-    # stale_obs while obs were perfectly current (0 trades, 2026-09-03).
-    # Sanity window only: reject a stalled feed (>90 min behind) and
-    # impossible future stamps (>15 min ahead).
-    if obs_time_utc is None:
-        return [{"action_type": "re_skip", "reason": "stale_obs", "key": key}]
-    obs_age = (now_utc.astimezone(timezone.utc) - obs_time_utc.astimezone(timezone.utc)).total_seconds()
-    if obs_age > obs_lookback_s or obs_age < -obs_future_s:
-        return [{"action_type": "re_skip", "reason": "stale_obs", "key": key, "obs_age_s": round(obs_age, 1)}]
-
-    broken = taf_b
-    broken_id = str(broken.get("bucket_id") or broken.get("id") or "")
-
-    # Long-horizon consensus filter on the *broken* bucket
-    consensus_meta: dict[str, Any] = {"ok": True, "reason": "disabled"}
-    if require_consensus:
-        consensus_meta = tracker.is_long_horizon_consensus(
-            city["city_id"],
-            market_local_date,
-            direction,
-            broken_id,
-            now_utc=now_utc,
-            window_seconds=cons_win,
-            min_lead=cons_min_lead,
-            require_rank1=True,
-            min_samples=cons_min_samples,
-        )
-        if not consensus_meta.get("ok"):
-            return [{
-                "action_type": "re_skip",
-                "reason": "consensus_filter",
-                "key": key,
-                "jump": jump,
-                "consensus": consensus_meta,
-            }]
-
-    # Jump policy: a reversal is a "reference extreme broken by one bucket".
-    # The reference's trustworthiness decides how much jump slack we allow:
-    #   - TAF TX/TN reference (ref_source="taf"): forecast extreme is
-    #     independent of the market, so a 2-bucket breach is a rare genuine
-    #     signal worth taking (NO-only).
-    #   - Market rank-1 consensus reference (ref_source="market_rank1"):
-    #     the reference IS the market's favourite bucket, so a large jump is
-    #     usually the favourite being wrong / thin books, not an edge — the
-    #     2026-09-05 jump=6 misfires (buenos-aires/qingdao/chicago) all came
-    #     from this path. Fire only at exactly max_consensus_jump (1 bucket)
-    #     when the reference is market-derived; anything larger is noise and
-    #     is skipped outright (no NO-only fire either).
-    max_consensus_jump = int(cfg.get("max_consensus_jump", MAX_BUCKET_JUMP))
-    if jump > max_jump:
-        if ref_source != "taf":
-            # market-consensus reference with an oversized jump → not an edge.
-            # Mark fired so the session doesn't re-arm and re-alert every tick.
-            tree["fired"][key] = {
-                "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
-                "ref_source": ref_source, "reason": "jump_too_large_for_ref",
-            }
-            tree["armed"].pop(key, None)
-            return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
-                     "jump": jump, "ref_source": ref_source}]
-        # TAF-sourced multi-bucket jump (2-bucket rare signal). YES-primary
-        # strategy: keep the momentum YES leg on the observed bucket (run_b);
-        # drop only the broken-bucket NO leg — its book is routinely empty
-        # (holders of a practically-won NO don't sell) and the momentum side
-        # is what carries the "keeps breaking" thesis.
-        fire_yes = True
-        new_b = run_b
-        _skip_no_leg = True
-        # mark the NO leg as skipped for the audit trail (re_skip_yes is now
-        # semantically the NO-leg skip under yes-primary sizing)
-        actions.append({"action_type": "re_skip_yes", "reason": "jump_gt_one_no_leg_skipped", "key": key, "jump": jump})
-    elif jump > max_consensus_jump and ref_source != "taf":
-        # same guard for the (jump <= max_jump but still > market-only cap)
-        # case — unreachable while max_consensus_jump == max_jump, kept for
-        # configurability if the TAF cap is later widened.
-        tree["fired"][key] = {
-            "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
-            "ref_source": ref_source, "reason": "jump_too_large_for_ref",
-        }
-        tree["armed"].pop(key, None)
-        return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
-                 "jump": jump, "ref_source": ref_source}]
-    else:
-        fire_yes = bool(cfg.get("yes_leg_enabled", True))
-        # new_b = the bucket the observed extreme has just entered. For a
-        # 1-bucket breach that is run_b (the immediate neighbour of the broken
-        # reference bucket). For a 2-bucket TAF breach the observed extreme
-        # still sits in a concrete bucket — buy ITS yes token (momentum leg),
-        # not nothing: with the yes-primary strategy the momentum leg is the
-        # tradeable side (broken-bucket NO books are routinely empty because
-        # holders of a practically-won NO never sell).
-        new_b = run_b
-        _skip_no_leg = False
-    # re-skip_yes suppression: with YES-primary we no longer drop the YES leg
-    # on a multi-bucket TAF jump — jump > max_jump only suppresses the NO leg.
-    # The jump>max_jump / market-ref guard above still returns before here.
+    # ---- First fire on bucket-climbing new high ------------------------------
+    # Dead buckets: every ordered bucket strictly below the new-high bucket
+    # (cascade, depth capped by max_jump from the previous high bucket).
+    climb = min(bucket_climb, max_jump)
+    dead_indices = list(range(prev_i, run_i))  # [prev, run) — prev high bucket is now dead too if we left it
+    # Actually: previous high was in prev_b; that bucket may still contain temps
+    # equal to old high, but NEW high is in a higher bucket → all buckets with
+    # hi <= new bucket's lo are dead for the daily HIGH market.
+    # Practical: NO on buckets from max(0, run_i - climb) .. run_i-1
+    dead_indices = list(range(max(0, run_i - climb), run_i))
 
     fire = {
         "key": key,
@@ -601,84 +500,65 @@ def maybe_arm_or_fire(
         "icao": city.get("icao"),
         "market_local_date": market_local_date,
         "direction": direction,
-        "ref_extreme": float(ref_extreme),
-        "ref_source": ref_source,
+        "ref_extreme": prev_f,
+        "ref_source": "metar_prev_high",
         "taf_extreme": float(taf_extreme) if taf_extreme is not None else None,
         "running_extreme": running,
-        "jump": jump,
-        "broken_bucket_id": broken_id,
-        "broken_no_token": broken.get("no_token_id") or broken.get("_no_token_id"),
-        "new_bucket_id": str(new_b.get("bucket_id") or new_b.get("id") or "") if new_b else None,
-        "new_yes_token": (new_b.get("yes_token_id") or new_b.get("_yes_token_id")) if new_b else None,
-        "consensus": consensus_meta,
+        "jump": bucket_climb,
+        "broken_bucket_id": str(ordered[dead_indices[-1]].get("bucket_id") or ordered[dead_indices[-1]].get("id") or "") if dead_indices else None,
+        "broken_no_token": None,
+        "new_bucket_id": new_bucket_id,
+        "new_yes_token": new_yes_token,
+        "trigger": "metar_new_high",
+        "prev_high": prev_f,
         "legs": [],
         "fire_budget_ms": int(cfg.get("fire_budget_ms", 8000)),
     }
-    # Cascade NO: buy NO on every broken bucket from ref to (but not including) current running bucket.
-    # YES: only the current METAR-proven latest high bucket (new_b / run_b).
-    yes_cap = Decimal(str(cfg.get("yes_max_ask", YES_MAX_ASK)))
-    yes_floor = Decimal(str(cfg.get("yes_min_ask", "0.40")))  # lottery filter: abort YES below this
-    no_cap = str(cfg.get("no_max_ask", NO_MAX_ASK))
-    no_pct = Decimal(str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)))
-    yes_pct = Decimal(str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT)))
 
-    if not _skip_no_leg and broken is not None:
-        # Primary broken bucket
+    n_dead = max(len(dead_indices), 1)
+    for j, idx in enumerate(dead_indices):
+        b = ordered[idx]
+        tok = b.get("no_token_id") or b.get("_no_token_id")
+        if not tok:
+            continue
+        leg_name = "buy_no_broken" if j == len(dead_indices) - 1 else f"buy_no_dead_{j}"
         fire["legs"].append({
-            "leg": "buy_no_broken",
-            "token_id": fire["broken_no_token"],
+            "leg": leg_name,
+            "token_id": tok,
             "side": "BUY",
             "outcome": "NO",
             "cap": no_cap,
-            "notional_pct": str(no_pct),
+            "notional_pct": str(no_pct / n_dead),
         })
-        # Additional dead buckets when jump >= 2 (cascade)
-        if jump >= 2 and ordered and broken is not None and run_b is not None:
-            try:
-                i_ref = ordered.index(broken) if broken in ordered else None
-                i_run = ordered.index(run_b) if run_b in ordered else None
-            except Exception:
-                i_ref = i_run = None
-            if i_ref is not None and i_run is not None:
-                # buckets strictly between ref and run (already broken, not the landing)
-                step = 1 if i_run > i_ref else -1
-                for i in range(i_ref + step, i_run, step):
-                    b = ordered[i]
-                    tok = b.get("no_token_id") or b.get("_no_token_id")
-                    if not tok:
-                        continue
-                    fire["legs"].append({
-                        "leg": f"buy_no_dead_{abs(i - i_ref)}",
-                        "token_id": tok,
-                        "side": "BUY",
-                        "outcome": "NO",
-                        "cap": no_cap,
-                        "notional_pct": str(no_pct / max(jump, 1)),  # split residual across dead legs
-                    })
+        if leg_name == "buy_no_broken":
+            fire["broken_no_token"] = tok
+            fire["broken_bucket_id"] = str(b.get("bucket_id") or b.get("id") or "")
 
-    if fire_yes and new_b is not None:
-        # Lottery filter: do not buy YES if cap itself is below floor (config safety)
-        if yes_cap < yes_floor:
-            pass  # skip YES leg entirely
-        else:
-            fire["legs"].append({
-                "leg": "buy_yes_new",
-                "token_id": fire["new_yes_token"],
-                "side": "BUY",
-                "outcome": "YES",
-                "cap": str(yes_cap),
-                "notional_pct": str(yes_pct),
-                "min_ask": str(yes_floor),  # execution layer should abort if best_ask < min_ask
-            })
+    if fire_yes and new_yes_token is not None and yes_cap >= yes_floor:
+        fire["legs"].append({
+            "leg": "buy_yes_new",
+            "token_id": new_yes_token,
+            "side": "BUY",
+            "outcome": "YES",
+            "cap": str(yes_cap),
+            "notional_pct": str(yes_pct),
+            "min_ask": str(yes_floor),
+        })
+
+    if not fire["legs"]:
+        return [{"action_type": "re_skip", "reason": "no_tradeable_legs", "key": key,
+                 "jump": bucket_climb, "running": running}]
+
     tree["fired"][key] = {
         "status": "fired",
         "at_utc": iso_utc(now_utc),
-        "jump": jump,
-        "ref_source": ref_source,
-        "consensus_rank": consensus_meta.get("rank"),
-        "running_extreme": float(fire.get("running_extreme") or running),
-        "new_bucket_id": fire.get("new_bucket_id"),
-        "new_yes_token": fire.get("new_yes_token"),
+        "jump": bucket_climb,
+        "ref_source": "metar_prev_high",
+        "running_extreme": running,
+        "new_bucket_id": new_bucket_id,
+        "new_yes_token": new_yes_token,
+        "trigger": "metar_new_high",
+        "prev_high": prev_f,
     }
     tree["armed"].pop(key, None)
     actions.append({"action_type": "re_fire", **fire})
