@@ -1,54 +1,59 @@
-# weatherbotyes2re
+# yes2re20260907grok
 
-METAR vs consensus **reversal** — see the break early, paper-fill before the scramble.
+Paper-only Polymarket daily **HIGH temperature** reversal bot.
 
-**No σ. No fade-NO / BUY-YES grid. No wallet. Paper only.**
+Fork lineage: `weatherbotyes2re@c575d93` + cross-midnight / TAF / book / dedupe safety hardening.
 
-## Rules
+**No live orders. No wallet. Paper only.**
 
-- High: `running_max`; Low: `running_min`.
-- Reference: TAF TX/TN if present (converted to market unit), else 1–2h rank-1 YES TWAP mid.
-- YES leg only if jump exactly 1 bucket; jump ≥ 2 → NO-only.
-- New `obs_time`, age ≤ 180s; high local hour ≥ 14; low ≤ 10.
-- Broken bucket must be rank-1 over `consensus_window_seconds` (default 7200).
-- Legs: BUY NO broken (cap 0.65, 75%) + optional BUY YES new (cap 0.48, 25%).
-- Idle ~20s; **ARM** → fast poll those ICAOs (~8s) while **full universe** still samples books/METAR slowly for consensus.
-- FIRE: in-memory L2 FAK, 8s budget, abort above cap. One fire per `city|date|direction`.
+## Strategy (locked)
 
-## Data path
+- **HIGH only** — LOW markets hard-rejected (config + strategy).
+- **NO cap 0.85** (unified, all jumps).
+- **Multi-jump cascade**: on a break of N buckets, buy NO on each broken bucket; buy YES only on the **current METAR-proven latest high bucket**.
+- **NO:YES notional = 1:1**.
+- **No lottery YES**: `yes_min_ask = 0.40` — YES leg aborted below this.
+- **No B2 sleeve** (code path removed / disabled).
+- Safety: stale_market_date guard (fail-closed), prune keeps open fired markers, already_fired per session_key, obs sanity window (90min/15min).
 
-| Need | Source |
-|------|--------|
-| METAR | **CheckWX + AviationWeather** (fresher wins) |
-| TAF TX/TN | CheckWX (optional; market rank-1 fallback) |
-| Units | METAR/TAF °C → city `market_unit` (°C/°F) |
-| Buckets / tokens | Gamma REST (cached ~20 min) |
-| Books | CLOB REST seed into `LocalOrderBook`; optional Market WS |
+First priority: profitability. Second: fast fills with high win-rate evidence.
 
-## Run
+## Run (paper)
 
 ```bash
-export CHECKWX_API_KEY=...   # still useful; AWC works without key
+export CHECKWX_API_KEY=...   # optional; AWC works keyless (no TAF)
 python3 tests_reversal.py
-python3 reversal_runner.py once --config config/yes2re_reversal.json
-python3 reversal_runner.py run  --config config/yes2re_reversal.json
+python3 reversal_runner.py run --config config/yes2re_reversal.json
+python3 reversal_runner.py status
+python3 -m tools.paper_dashboard
 ```
 
-Logs: `data/yes2re_events.jsonl` · Health: `data/yes2re_health.json`
+## Config knobs
 
-WSL: `networkingMode=mirrored` for Gamma/CLOB.
+| Key | Default | Note |
+|-----|---------|------|
+| `paper_initial_capital_usdc` | 1000 | |
+| `fire_budget_usdc` | 60 | ≤ 6% of 1000 |
+| `max_open_positions` | 0 | 0 = unlimited; cash until settlement releases |
+| `strategy.no_max_ask` | 0.85 | |
+| `strategy.yes_min_ask` | 0.40 | lottery floor |
+| `strategy.max_bucket_jump` | 3 | cascade depth |
+| `directions_enabled` | ["high"] | |
 
-## Latency notes
+## Paper PnL
 
-- Prefer a low-latency VPS near Polymarket CLOB (often US East).
-- Keep token ids + books warm before FIRE; do not discover tokens on the fire path.
-- Bottleneck is METAR publish lag + CLOB RTT, not Python microbenchmarks.
+- `health.json` updated each cycle (when wired).
+- `python3 -m tools.paper_dashboard` — equity, realized/unrealized, win rate, NO/YES split.
+- `reversal_runner.py status` includes `pnl` block.
 
-## poly-yes2
+Equity ≈ initial − net_debit + unrealized MTM (open legs marked to book when available).
 
-This repo is the **canonical reversal paper** stack. Archive or ignore poly-yes2 treeB for reversal.
-Keep poly-yes2 only if you still need the old three-arm / Hermes / settlement-review history.
+## Layout
 
-## Safety
+- `reversal_strategy.py` — arm/fire state machine + guards
+- `_r_cycle.py` / `_r_exec.py` / `_r_state.py` — dual-rate loop, settle, state
+- `re_execution.py` — capped FAK ladder
+- `paper_mtm.py` / `tools/paper_dashboard.py` — MTM + CLI
+- `config/yes2re_reversal.json` — runtime config
 
-`reversal_runner.py` hard-blocks any mode other than `paper`.
+See [STRATEGY.md](STRATEGY.md) for rules detail.

@@ -12,6 +12,7 @@ from _r_state import load_config, load_state, save_state, log_event, STATE_VERSI
 from _r_cycle import run_cycle
 from _r_exec import write_health
 from research import common as _common_adapter
+from paper_mtm import compute_paper_pnl
 
 
 def main() -> int:
@@ -43,12 +44,14 @@ def main() -> int:
 
     if args.command == "status":
         write_health(cfg, state)
+        pnl = compute_paper_pnl(state, initial_capital=cfg.get("paper_initial_capital_usdc"))
         print(json.dumps({
             "health": cfg["health_path"],
             "armed": list(ensure_re_state(state).get("armed", {})),
             "fired": list(ensure_re_state(state).get("fired", {})),
             "open": sum(1 for p in state["positions"].values() if not p.get("settled")),
             "entries": state.get("entry_count", 0),
+            "pnl": pnl,
         }, indent=2))
         return 0
 

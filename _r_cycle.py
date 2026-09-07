@@ -35,6 +35,7 @@ from _r_globals import book_cache, bump, clob, set_health_extra, stamp, tracker
 from _r_state import DEFAULTS, log_event
 from adapters.polymarket.orderbook import from_any
 from paper_capital import reserve
+from paper_mtm import compute_paper_pnl
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire
 from ws_bridge import ws_bridge
