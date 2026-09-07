@@ -104,6 +104,22 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
     ask = best_ask(book)
     if ask is None:
         return {"status": "no_book", "leg": leg.get("leg")}
+
+    # Lottery / dust filter: YES (or any leg with min_ask) must not buy below floor.
+    # Config yes_min_ask=0.40 — prevents 0.001 dust fills that are already-dead buckets.
+    min_ask = leg.get("min_ask")
+    if min_ask is not None:
+        min_ask_d = _dec(min_ask)
+        if ask < min_ask_d:
+            return {
+                "status": "abort_below_min_ask",
+                "leg": leg.get("leg"),
+                "best_ask": str(ask),
+                "min_ask": str(min_ask_d),
+                "cap": str(cap),
+                "note": "lottery_or_dead_bucket_stand_down",
+            }
+
     # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
     extra = 0
     if elapsed_ms >= LADDER_MS[1]:
@@ -130,6 +146,7 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
         "shares": str(target_shares),
         "best_ask": str(ask),
         "cap": str(cap),
+        "min_ask": str(min_ask) if min_ask is not None else None,
         "extra_ticks": extra,
         "elapsed_ms": elapsed_ms,
         "at_utc": iso_utc(now_utc),

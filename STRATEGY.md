@@ -35,3 +35,10 @@ When live METAR proves the daily high has broken the reference extreme (TAF TX p
 ## What this release does *not* yet fully automate
 
 Rolling YES on **further** breaks within the same session (sell prior YES FAK → buy new dead NO → buy newest YES) is specified as the intended behaviour; the first ship focuses on correct first-fire cascade + safety. Track as follow-up if paper evidence shows frequent multi-step highs.
+
+
+## Lottery YES (forbidden)
+
+Execution enforces `yes_min_ask` (default **0.40**). If best_ask on the new-high YES token is below the floor, the leg returns `abort_below_min_ask` and does not fill.
+
+**Intended edge (not dust):** the reference high bucket should have been a *real* market consensus for ~1–2h (meaningful YES TWAP, not 0.001). METAR then proves a break into the next bucket; that new YES is fought over and re-prices quickly. A fire whose rank-1 / new YES is already at dust prices is not this edge — it is a late or thin-book artifact.

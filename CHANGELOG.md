@@ -1,4 +1,24 @@
-# Changelog — weatherbotyes2re
+# Changelog — yes2re20260907grok
+
+## 2026-09-07 — Lottery YES blocked; min_ask enforced at execution
+
+- **Root cause (sandbox fire `kuala-lumpur|2026-09-07|high`)**: strategy attached
+  `min_ask=0.40` on the YES leg, but `re_execution.plan_leg_attempts` never
+  read it — FAK walked a **0.001** dust ask and paper-filled 35.29 shares.
+- **Fix**: BUY legs with `min_ask` now return `abort_below_min_ask` when
+  `best_ask < min_ask` (stand down; no fill). Config `strategy.yes_min_ask`
+  remains **0.40**.
+- **Why that fire was not the intended edge**: ref_source was `market_rank1`,
+  and earlier the same session’s consensus sample showed rank-1 YES **TWAP
+  already 0.001** (thin lead, n_samples=2). The “new high” bucket was already
+  priced as dead/dust — not a contested re-rating after a solid TAF/consensus
+  high held for 1–2h. True edge requires a high-priced consensus high bucket
+  *then* METAR break; dust rank-1 is noise, not opportunity.
+- Further-break YES roll (`re_roll_yes`) and cascade NO remain as previously
+  shipped.
+
+## Upstream history (weatherbotyes2re lineage)
+
 
 ## 2026-09-04 — Fire deadlock fix; WS live feed; paper-ledger fix (audited)
 
