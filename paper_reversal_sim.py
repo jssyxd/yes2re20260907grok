@@ -96,7 +96,8 @@ def scenario_one_bucket_fill():
     return {"name":"one_bucket_fill","actions":[a["action_type"] for a in actions],"fire_jump":fire["jump"],"fills":{k:{kk:str(vv) for kk,vv in v.items()} for k,v in fills.items()},"leftover":{k:str(v) for k,v in leftover.items()},"send_faks":sum(1 for x in log if x.get("status")=="send_fak"),"ok":fills["buy_no_broken"]["shares"]>0}
 
 
-def scenario_two_bucket_yes_skipped():
+def scenario_two_bucket_cascade():
+    """jump>=2: cascade NO on dead buckets + YES on current METAR high (yes2re20260907grok)."""
     state={}; city=make_city(); buckets=make_buckets()
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
@@ -104,7 +105,10 @@ def scenario_two_bucket_yes_skipped():
     actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 33.2, now, now, {}, PAPER_CFG, tracker)
     fire=next((a for a in actions if a.get("action_type")=="re_fire"), None)
     legs=[x["leg"] for x in (fire or {}).get("legs", [])]
-    return {"name":"two_bucket_yes_skipped","types":[a["action_type"] for a in actions],"legs":legs,"ok":fire is not None and "buy_yes_new" not in legs and "buy_no_broken" in legs}
+    has_no = any(l.startswith("buy_no") for l in legs)
+    has_yes = "buy_yes_new" in legs
+    return {"name":"two_bucket_cascade","types":[a["action_type"] for a in actions],"legs":legs,
+            "ok":fire is not None and has_no and has_yes and fire.get("jump",0)>=2}
 
 
 def scenario_stale_obs_no_fire():
@@ -170,7 +174,7 @@ def run_scenarios():
     results=[]; failed=0
     for fn in (
         scenario_one_bucket_fill,
-        scenario_two_bucket_yes_skipped,
+        scenario_two_bucket_cascade,
         scenario_stale_obs_no_fire,
         scenario_morning_skip,
         scenario_cap_abort,

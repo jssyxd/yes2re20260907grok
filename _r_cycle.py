@@ -291,11 +291,19 @@ def _paper_fire(
             ladlog.append(intent)
             if intent.get("status") != "send_fak":
                 continue
-            match = re_execution.paper_match_fak(
-                cache.get(intent.get("token_id")) if intent.get("token_id") in cache else {},
-                Decimal(intent["limit_price"]),
-                Decimal(intent["shares"]),
-            )
+            book = cache.get(intent.get("token_id")) if intent.get("token_id") in cache else {}
+            if str(intent.get("side") or "BUY").upper() == "SELL":
+                match = re_execution.paper_match_fak_sell(
+                    book,
+                    Decimal(intent["limit_price"]),
+                    Decimal(intent["shares"]),
+                )
+            else:
+                match = re_execution.paper_match_fak(
+                    book,
+                    Decimal(intent["limit_price"]),
+                    Decimal(intent["shares"]),
+                )
             fills[intent["leg"]]["shares"] += match["filled_shares"]
             fills[intent["leg"]]["cost"] += match["cost"]
             remaining[intent["leg"]] = match["unfilled"]
@@ -539,11 +547,23 @@ def run_cycle(
             if atype == "re_arm":
                 armed_any = True
                 log_event(log_path, {"type": "arm", "key": action.get("key"), **{k: action[k] for k in ("ref_source", "distance_c") if k in action}})
-            elif atype in ("re_fire",):
-                log_event(log_path, {"type": "fire_attempt", "key": action.get("key"), "jump": action.get("jump"), "ref_source": action.get("ref_source")})
+            elif atype in ("re_fire", "re_roll_yes"):
+                log_event(log_path, {
+                    "type": "fire_attempt" if atype == "re_fire" else "roll_yes_attempt",
+                    "key": action.get("key"),
+                    "jump": action.get("jump"),
+                    "ref_source": action.get("ref_source"),
+                    "roll": atype == "re_roll_yes",
+                    "prev_bucket_id": action.get("prev_bucket_id"),
+                    "new_bucket_id": action.get("new_bucket_id"),
+                })
                 position, ladlog = _paper_fire(cfg, state, action, now)
                 if position is not None:
                     _record_fire_event(cfg, state, action, position, ladlog, now)
+                    if atype == "re_roll_yes":
+                        log_event(log_path, {"type": "roll_yes", "key": action.get("key"),
+                                             "prev_bucket_id": action.get("prev_bucket_id"),
+                                             "new_bucket_id": action.get("new_bucket_id")})
                 else:
                     # insufficient capital / nothing fillable — mark fired anyway
                     # so we don't retry-fire the same session each tick.

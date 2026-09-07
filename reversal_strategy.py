@@ -297,8 +297,17 @@ def maybe_arm_or_fire(
         now_utc,
     )
 
+    # Already-fired: default skip, BUT allow further-break YES roll when the
+    # running high has moved into a new higher bucket than last fire.
     if key in tree["fired"]:
-        return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
+        fired_rec = tree["fired"].get(key) or {}
+        last_run = fired_rec.get("running_extreme")
+        last_bucket = fired_rec.get("new_bucket_id")
+        # Fall through only if we can detect a higher break; else skip.
+        # Actual roll decision is computed after running_extreme update below.
+        pass  # defer to post-update roll check
+    else:
+        fired_rec = None
 
     # Open-position cap: never open a new position while the number of
     # unsettled paper positions is at/over max_open_positions. Prevents
@@ -306,7 +315,7 @@ def maybe_arm_or_fire(
     # (max_open_positions previously existed only as a DEFAULTS entry with no
     # enforcement — positions could stack past the cap).
     max_open = int(cfg.get("max_open_positions") or 0)
-    if max_open > 0:
+    if max_open > 0 and key not in tree["fired"]:
         open_count = sum(
             1 for p in (state.get("positions") or {}).values()
             if not p.get("settled")
@@ -384,6 +393,107 @@ def maybe_arm_or_fire(
     # jump > 0 : potential break
     if not hour_ok(direction, local_hour, high_hour, low_hour_end):
         return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key, "jump": jump}]
+
+    # --- Further-break YES roll (same session already fired) -----------------
+    # If we already fired and the running high has moved into a *new* higher
+    # bucket than last fire's new_bucket_id, emit: sell prior YES (FAK discount),
+    # buy NO on newly broken bucket(s), buy YES on current high.
+    if key in tree["fired"]:
+        prev = tree["fired"].get(key) or {}
+        prev_bucket_id = str(prev.get("new_bucket_id") or "")
+        cur_bucket_id = str(run_b.get("bucket_id") or run_b.get("id") or "") if run_b else ""
+        prev_run = prev.get("running_extreme")
+        if not cur_bucket_id or cur_bucket_id == prev_bucket_id:
+            return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
+        if prev_run is not None and float(running) <= float(prev_run) + 1e-9:
+            return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
+        # Higher break confirmed — build roll action
+        yes_cap = str(cfg.get("yes_max_ask", YES_MAX_ASK))
+        yes_floor = Decimal(str(cfg.get("yes_min_ask", "0.40")))
+        no_cap = str(cfg.get("no_max_ask", NO_MAX_ASK))
+        no_pct = str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT))
+        yes_pct = str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT))
+        sell_slip = str(cfg.get("yes_roll_sell_slip", "0.05"))  # FAK discount from best bid
+        roll = {
+            "action_type": "re_roll_yes",
+            "key": key,
+            "city_id": city["city_id"],
+            "icao": city.get("icao"),
+            "market_local_date": market_local_date,
+            "direction": direction,
+            "prev_bucket_id": prev_bucket_id,
+            "new_bucket_id": cur_bucket_id,
+            "prev_running": prev_run,
+            "running_extreme": running,
+            "jump": jump,
+            "legs": [],
+            "fire_budget_ms": int(cfg.get("fire_budget_ms", 8000)),
+        }
+        # Sell prior YES (token from position if present)
+        pos = (state.get("positions") or {}).get(key) or {}
+        prev_yes_token = None
+        for leg in (pos.get("legs") or []):
+            if isinstance(leg, dict) and (
+                leg.get("leg") == "buy_yes_new" or str(leg.get("outcome","")).upper() == "YES"
+            ):
+                prev_yes_token = leg.get("token_id")
+                break
+        if prev_yes_token is None:
+            prev_yes_token = prev.get("new_yes_token")
+        if prev_yes_token:
+            roll["legs"].append({
+                "leg": "sell_yes_old",
+                "token_id": prev_yes_token,
+                "side": "SELL",
+                "outcome": "YES",
+                "cap": sell_slip,  # interpreted as max slip from bid in exec
+                "notional_pct": "1.0",
+                "roll": True,
+            })
+        # NO on newly broken (previous landing bucket is now dead)
+        if prev_bucket_id:
+            # find no token for prev landing bucket
+            for b in ordered:
+                bid = str(b.get("bucket_id") or b.get("id") or "")
+                if bid == prev_bucket_id:
+                    tok = b.get("no_token_id") or b.get("_no_token_id")
+                    if tok:
+                        roll["legs"].append({
+                            "leg": "buy_no_broken",
+                            "token_id": tok,
+                            "side": "BUY",
+                            "outcome": "NO",
+                            "cap": no_cap,
+                            "notional_pct": no_pct,
+                            "roll": True,
+                        })
+                    break
+        # YES on current high
+        new_yes = (run_b.get("yes_token_id") or run_b.get("_yes_token_id")) if run_b else None
+        if new_yes and Decimal(str(cfg.get("yes_max_ask", YES_MAX_ASK))) >= yes_floor:
+            roll["legs"].append({
+                "leg": "buy_yes_new",
+                "token_id": new_yes,
+                "side": "BUY",
+                "outcome": "YES",
+                "cap": yes_cap,
+                "notional_pct": yes_pct,
+                "min_ask": str(yes_floor),
+                "roll": True,
+            })
+        tree["fired"][key] = {
+            "status": "fired_roll",
+            "at_utc": iso_utc(now_utc),
+            "jump": jump,
+            "running_extreme": running,
+            "new_bucket_id": cur_bucket_id,
+            "new_yes_token": new_yes,
+            "prev_bucket_id": prev_bucket_id,
+            "roll": True,
+        }
+        actions.append(roll)
+        return actions
+
     # Freshness = "a NEW observation arrived" (deduped by is_new_obs_time
     # above) — NOT "the observation happened within N seconds". METAR/SPECI
     # run on a 20-60 min cadence: obs_time age swings 0-60 min between
@@ -523,9 +633,9 @@ def maybe_arm_or_fire(
             "notional_pct": str(no_pct),
         })
         # Additional dead buckets when jump >= 2 (cascade)
-        if jump >= 2 and ordered and ref_b is not None and run_b is not None:
+        if jump >= 2 and ordered and broken is not None and run_b is not None:
             try:
-                i_ref = ordered.index(ref_b) if ref_b in ordered else None
+                i_ref = ordered.index(broken) if broken in ordered else None
                 i_run = ordered.index(run_b) if run_b in ordered else None
             except Exception:
                 i_ref = i_run = None
@@ -566,6 +676,9 @@ def maybe_arm_or_fire(
         "jump": jump,
         "ref_source": ref_source,
         "consensus_rank": consensus_meta.get("rank"),
+        "running_extreme": float(fire.get("running_extreme") or running),
+        "new_bucket_id": fire.get("new_bucket_id"),
+        "new_yes_token": fire.get("new_yes_token"),
     }
     tree["armed"].pop(key, None)
     actions.append({"action_type": "re_fire", **fire})
